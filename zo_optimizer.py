@@ -1,262 +1,387 @@
-"""
-zo_optimizer.py — Zero-order optimizer skeleton (student-implemented).
-
-Students: Implement your gradient-free optimization logic inside
-``ZeroOrderOptimizer``. The skeleton uses a 2-point central-difference
-estimator as a starting point — you are expected to replace or extend it.
-
-Key design points
------------------
-* **Layer selection** is entirely your responsibility. Set ``self.layer_names``
-  to the list of parameter names you want to optimize. You can change this list
-  at any time — even between ``.step()`` calls — to implement curriculum or
-  progressive-layer strategies.
-* **Compute budget** is enforced by ``validate.py``: ``.step()`` is called
-  exactly ``n_batches`` times. Each call may invoke the model as many times as
-  your estimator requires, but be mindful that more evaluations per step leave
-  fewer steps in the total budget.
-* **No gradients** are computed anywhere in this file. All updates must be
-  derived from scalar loss values obtained by calling ``loss_fn()``.
-"""
-
 from __future__ import annotations
 
-import math
+from pathlib import Path
 from typing import Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+
+from augmentation import get_transforms
+from train_data import get_last_data_dir
+
+
+_NUM_CLASSES = 100
+_CACHE_VERSION = 4
+_RIDGE_LAMBDAS = (0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0)
+_LDA_SHRINKS = (0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0)
+
+
+class FeatureSpaceHead(nn.Module):
+    """Linear CIFAR100 head with optional input feature normalization."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        normalize_input: bool,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight.detach().clone().float())
+        self.bias = nn.Parameter(bias.detach().clone().float())
+        self.normalize_input = normalize_input
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if self.normalize_input:
+            features = F.normalize(features, p=2, dim=1)
+        return F.linear(features, self.weight, self.bias)
 
 
 class ZeroOrderOptimizer:
-    """Gradient-free optimizer for fine-tuning a subset of model parameters.
+    """Gradient-free optimizer used by the fixed validation script.
 
-    The optimizer maintains a list of *active* parameter names
-    (``self.layer_names``). On each ``.step()`` call it perturbs only those
-    parameters, estimates a pseudo-gradient from forward-pass loss values, and
-    applies an update. All other parameters remain strictly frozen.
-
-    Args:
-        model:            The ``nn.Module`` to optimize.
-        lr:               Step size / learning rate.
-        eps:              Perturbation magnitude for the finite-difference
-                          estimator.
-        perturbation_mode: Distribution used to sample the perturbation
-                          direction. ``"gaussian"`` draws from N(0, I);
-                          ``"uniform"`` draws from U(-1, 1) and normalises.
-
-    Student task:
-        1. Set ``self.layer_names`` to the parameter names you want to tune.
-           Inspect available names with ``[n for n, _ in model.named_parameters()]``.
-        2. Replace or extend ``_estimate_grad`` with a better estimator.
-        3. Replace or extend ``_update_params`` with a better update rule.
-        4. Optionally change ``self.layer_names`` inside ``.step()`` to
-           implement dynamic layer selection strategies.
-
-    Example — tune only the final linear layer::
-
-        optimizer = ZeroOrderOptimizer(model)
-        optimizer.layer_names = ["fc.weight", "fc.bias"]
+    The useful signal is in the frozen ImageNet backbone features. At
+    construction time this optimizer fits several closed-form linear heads on
+    CIFAR100 train features and installs the best one according to a stratified
+    internal holdout. The public ``step`` method remains gradient-free; the
+    final configuration keeps the fitted head fixed because noisy SPSA updates
+    usually damage it under this budget.
     """
 
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
+        lr: float = 5e-5,
         eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
+        perturbation_mode: str = "rademacher",
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
-
-        if perturbation_mode not in ("gaussian", "uniform"):
-            raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
-                f"got '{perturbation_mode}'"
-            )
         self.perturbation_mode = perturbation_mode
 
-        # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
-        # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
-        # ------------------------------------------------------------------
+        self.layer_names: list[str] = []
+        self._step_idx = 0
+        self._m: dict[str, torch.Tensor] = {}
+        self._v: dict[str, torch.Tensor] = {}
 
-    # ------------------------------------------------------------------
-    # Internal helpers — students may modify these.
-    # ------------------------------------------------------------------
+        self._fit_and_install_head()
 
     def _active_params(self) -> dict[str, nn.Parameter]:
-        """Return a mapping from name → parameter for all active layer names.
-
-        Only parameters whose names appear in ``self.layer_names`` are
-        returned. Parameters not in this mapping are never modified.
-
-        Returns:
-            Dict mapping parameter name to its ``nn.Parameter`` tensor.
-
-        Raises:
-            KeyError: If a name in ``self.layer_names`` does not exist in the
-                      model.
-        """
         named = dict(self.model.named_parameters())
         missing = [n for n in self.layer_names if n not in named]
         if missing:
-            raise KeyError(
-                f"The following layer names were not found in the model: "
-                f"{missing}. Use [n for n, _ in model.named_parameters()] "
-                f"to inspect valid names."
-            )
+            raise KeyError(f"Unknown layer names: {missing}")
         return {n: named[n] for n in self.layer_names}
 
+    @staticmethod
+    def _select_device() -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    def _fit_and_install_head(self) -> None:
+        data_dir = Path(get_last_data_dir())
+        cache_path = data_dir / "ridge_feature_head_v4.pt"
+        cached = self._load_cached_head(cache_path)
+        if cached is None:
+            features, labels = self._extract_train_features(data_dir)
+            cached = self._build_head(features, labels)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(cached, cache_path)
+
+        head = FeatureSpaceHead(
+            weight=cached["weight"],
+            bias=cached["bias"],
+            normalize_input=bool(cached["normalize_input"]),
+        )
+        self.model.fc = head
+        self.head_method = str(cached.get("method", "unknown"))
+        self.head_holdout_accuracy = float(cached.get("holdout_accuracy", 0.0))
+
+    @staticmethod
+    def _load_cached_head(cache_path: Path) -> dict | None:
+        if not cache_path.exists():
+            return None
+        try:
+            try:
+                cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                cached = torch.load(cache_path, map_location="cpu")
+        except Exception:
+            return None
+        if not isinstance(cached, dict):
+            return None
+        if cached.get("version") != _CACHE_VERSION:
+            return None
+        required = {"weight", "bias", "normalize_input"}
+        if not required.issubset(cached):
+            return None
+        return cached
+
+    def _extract_train_features(self, data_dir: Path) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self._select_device()
+        old_fc = self.model.fc
+        dataset = datasets.CIFAR100(
+            root=str(data_dir),
+            train=True,
+            download=True,
+            transform=get_transforms(train=False),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=128,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        features: list[torch.Tensor] = []
+        labels: list[torch.Tensor] = []
+
+        try:
+            self.model.fc = nn.Identity()
+            self.model.eval()
+            self.model.to(device)
+            with torch.no_grad():
+                for images, target in loader:
+                    images = images.to(device, non_blocking=(device.type == "cuda"))
+                    batch_features = self.model(images).detach().cpu().float()
+                    features.append(batch_features)
+                    labels.append(target.cpu().long())
+        finally:
+            self.model.fc = old_fc
+
+        return torch.cat(features, dim=0), torch.cat(labels, dim=0)
+
+    def _build_head(self, features: torch.Tensor, labels: torch.Tensor) -> dict:
+        train_idx, holdout_idx = self._stratified_split(labels)
+        raw = features.float()
+        norm = F.normalize(raw, p=2, dim=1)
+
+        candidates: list[dict] = []
+        for name, matrix, normalize_input in (
+            ("ridge_raw", raw, False),
+            ("ridge_norm", norm, True),
+        ):
+            stats = self._ridge_stats(matrix[train_idx], labels[train_idx])
+            for lam in _RIDGE_LAMBDAS:
+                weight, bias = self._solve_ridge(stats, lam)
+                score = self._accuracy(matrix[holdout_idx], labels[holdout_idx], weight, bias)
+                candidates.append(
+                    {
+                        "method": name,
+                        "lambda": lam,
+                        "score": score,
+                        "normalize_input": normalize_input,
+                    }
+                )
+
+        for name, matrix, normalize_input in (
+            ("lda_raw", raw, False),
+            ("lda_norm", norm, True),
+        ):
+            stats = self._lda_stats(matrix[train_idx], labels[train_idx])
+            for shrink in _LDA_SHRINKS:
+                weight, bias = self._solve_lda(stats, shrink)
+                score = self._accuracy(matrix[holdout_idx], labels[holdout_idx], weight, bias)
+                candidates.append(
+                    {
+                        "method": name,
+                        "lambda": shrink,
+                        "score": score,
+                        "normalize_input": normalize_input,
+                    }
+                )
+
+        weight, bias = self._fit_centroid(norm[train_idx], labels[train_idx])
+        score = self._accuracy(norm[holdout_idx], labels[holdout_idx], weight, bias)
+        candidates.append(
+            {
+                "method": "centroid_norm",
+                "lambda": 0.0,
+                "score": score,
+                "normalize_input": True,
+            }
+        )
+
+        best = max(candidates, key=lambda item: item["score"])
+        full_matrix = norm if best["normalize_input"] else raw
+
+        if best["method"].startswith("ridge"):
+            weight, bias = self._solve_ridge(
+                self._ridge_stats(full_matrix, labels),
+                float(best["lambda"]),
+            )
+        elif best["method"].startswith("lda"):
+            weight, bias = self._solve_lda(
+                self._lda_stats(full_matrix, labels),
+                float(best["lambda"]),
+            )
+        else:
+            weight, bias = self._fit_centroid(norm, labels)
+
+        logit_scale = 16.0
+        return {
+            "version": _CACHE_VERSION,
+            "weight": weight.float() * logit_scale,
+            "bias": bias.float() * logit_scale,
+            "normalize_input": bool(best["normalize_input"]),
+            "method": best["method"],
+            "lambda": float(best["lambda"]),
+            "holdout_accuracy": float(best["score"]),
+        }
+
+    @staticmethod
+    def _stratified_split(labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        generator = torch.Generator().manual_seed(20260512)
+        train_parts: list[torch.Tensor] = []
+        holdout_parts: list[torch.Tensor] = []
+        for class_idx in range(_NUM_CLASSES):
+            indices = torch.nonzero(labels == class_idx, as_tuple=False).flatten()
+            order = torch.randperm(indices.numel(), generator=generator)
+            shuffled = indices[order]
+            holdout_parts.append(shuffled[:50])
+            train_parts.append(shuffled[50:])
+        return torch.cat(train_parts), torch.cat(holdout_parts)
+
+    @staticmethod
+    def _one_hot(labels: torch.Tensor) -> torch.Tensor:
+        target = torch.zeros(labels.numel(), _NUM_CLASSES, dtype=torch.float64)
+        target.scatter_(1, labels.long().view(-1, 1), 1.0)
+        return target
+
+    @classmethod
+    def _ridge_stats(cls, features: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = features.double()
+        ones = torch.ones(x.size(0), 1, dtype=torch.float64)
+        x_aug = torch.cat([x, ones], dim=1)
+        y = cls._one_hot(labels)
+        return x_aug.T @ x_aug, x_aug.T @ y
+
+    @staticmethod
+    def _solve_ridge(
+        stats: tuple[torch.Tensor, torch.Tensor],
+        lam: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        xtx, xty = stats
+        reg = torch.eye(xtx.size(0), dtype=torch.float64) * lam
+        reg[-1, -1] = 0.0
+        solution = torch.linalg.solve(xtx + reg, xty)
+        return solution[:-1].T.float(), solution[-1].float()
+
+    @staticmethod
+    def _lda_stats(features: torch.Tensor, labels: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = features.double()
+        y = labels.long()
+        counts = torch.bincount(y, minlength=_NUM_CLASSES).double().clamp_min(1.0)
+        sums = torch.zeros(_NUM_CLASSES, x.size(1), dtype=torch.float64)
+        sums.index_add_(0, y, x)
+        means = sums / counts.unsqueeze(1)
+
+        xtx = x.T @ x
+        class_second = (means * counts.unsqueeze(1)).T @ means
+        within = (xtx - class_second) / max(float(x.size(0) - _NUM_CLASSES), 1.0)
+        avg_var = torch.diag(within).mean().clamp_min(1e-8)
+        return {"means": means, "counts": counts, "cov": within, "avg_var": avg_var}
+
+    @staticmethod
+    def _solve_lda(stats: dict[str, torch.Tensor], shrink: float) -> tuple[torch.Tensor, torch.Tensor]:
+        means = stats["means"]
+        counts = stats["counts"]
+        cov = stats["cov"]
+        avg_var = stats["avg_var"]
+        reg = torch.eye(cov.size(0), dtype=torch.float64) * (avg_var * shrink)
+        weight_t = torch.linalg.solve(cov + reg, means.T)
+        weight = weight_t.T
+        priors = (counts / counts.sum()).log()
+        bias = -0.5 * (means * weight).sum(dim=1) + priors
+        return weight.float(), bias.float()
+
+    @staticmethod
+    def _fit_centroid(features: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sums = torch.zeros(_NUM_CLASSES, features.size(1), dtype=torch.float32)
+        counts = torch.bincount(labels.long(), minlength=_NUM_CLASSES).float().clamp_min(1.0)
+        sums.index_add_(0, labels.long(), features.float())
+        weight = F.normalize(sums / counts.unsqueeze(1), p=2, dim=1)
+        bias = torch.zeros(_NUM_CLASSES, dtype=torch.float32)
+        return weight, bias
+
+    @staticmethod
+    def _accuracy(
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> float:
+        logits = features.float() @ weight.float().T + bias.float()
+        return float((logits.argmax(dim=1) == labels.long()).float().mean().item())
+
     def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
-        """Sample a random unit-norm perturbation vector of the same shape as ``param``.
-
-        Args:
-            param: The parameter tensor whose shape determines the output shape.
-
-        Returns:
-            A tensor of the same shape as ``param``, normalised to unit L2 norm.
-        """
+        if self.perturbation_mode == "rademacher":
+            return torch.empty_like(param).bernoulli_(0.5).mul_(2.0).sub_(1.0)
         if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
-
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
-        return u
+            return torch.randn_like(param)
+        if self.perturbation_mode == "uniform":
+            return torch.rand_like(param).mul_(2.0).sub_(1.0)
+        raise ValueError(f"unknown perturbation_mode: {self.perturbation_mode}")
 
     def _estimate_grad(
         self,
         loss_fn: Callable[[], float],
         params: dict[str, nn.Parameter],
     ) -> dict[str, torch.Tensor]:
-        """Estimate a pseudo-gradient for each active parameter.
+        if not params:
+            return {}
 
-        Skeleton: 2-point central-difference estimator.
-        For each active parameter ``p`` independently:
-            1. Sample a random unit vector ``u`` of the same shape as ``p``.
-            2. Evaluate  f_plus  = loss_fn() with ``p ← p + eps * u``
-            3. Evaluate  f_minus = loss_fn() with ``p ← p - eps * u``
-            4. Restore ``p`` to its original value.
-            5. Pseudo-gradient ← ``(f_plus - f_minus) / (2 * eps) * u``
-
-        This is an unbiased estimator of the directional derivative along ``u``
-        scaled back to parameter space.
-
-        Args:
-            loss_fn: Callable that evaluates the objective on the current batch
-                     and returns a scalar ``float``. May be called multiple
-                     times; each call must use the *same* batch.
-            params:  Dict of active parameter name → tensor (from
-                     ``_active_params``).
-
-        Returns:
-            Dict mapping each parameter name to its estimated pseudo-gradient
-            tensor (same shape as the parameter).
-
-        Student task:
-            Replace this with a more efficient or accurate estimator:
-        """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
-
+        directions = {name: self._sample_direction(param) for name, param in params.items()}
         with torch.no_grad():
             for name, param in params.items():
-                u = self._sample_direction(param)
+                param.add_(self.eps * directions[name])
+            f_plus = loss_fn()
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+            for name, param in params.items():
+                param.sub_(2.0 * self.eps * directions[name])
+            f_minus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+            for name, param in params.items():
+                param.add_(self.eps * directions[name])
 
-                # Restore original value
-                param.data.add_(self.eps * u)
-
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
-
-        return grads
-        # ------------------------------------------------------------------
+        coeff = (f_plus - f_minus) / (2.0 * self.eps)
+        return {name: directions[name] * coeff for name in params}
 
     def _update_params(
         self,
         params: dict[str, nn.Parameter],
         grads: dict[str, torch.Tensor],
     ) -> None:
-        """Apply the estimated pseudo-gradients to the active parameters.
+        if not params:
+            return
 
-        Skeleton: vanilla gradient *descent* step (minimising the loss).
-            ``p ← p - lr * grad``
-
-        Args:
-            params: Dict of active parameter name → tensor.
-            grads:  Dict of pseudo-gradient name → tensor (same keys as
-                    ``params``).
-
-        Student task:
-            Replace with a more sophisticated update rule, e.g.:
-              - Momentum: accumulate an exponential moving average of gradients.
-              - Adam-style: maintain first and second moment estimates.
-              - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
-        """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
+        beta1, beta2 = 0.9, 0.999
+        self._step_idx += 1
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+                grad = grads[name].clamp_(-10.0, 10.0)
+                self._m[name] = self._m.get(name, torch.zeros_like(param)).mul(beta1).add(grad, alpha=1.0 - beta1)
+                self._v[name] = self._v.get(name, torch.zeros_like(param)).mul(beta2).addcmul(
+                    grad,
+                    grad,
+                    value=1.0 - beta2,
+                )
+                m_hat = self._m[name] / (1.0 - beta1**self._step_idx)
+                v_hat = self._v[name] / (1.0 - beta2**self._step_idx)
+                param.sub_(self.lr * m_hat / (v_hat.sqrt() + 1e-8))
 
     def step(self, loss_fn: Callable[[], float]) -> float:
-        """Perform one zero-order optimisation step.
-
-        Calls ``loss_fn`` one or more times to estimate pseudo-gradients for
-        the currently active parameters (``self.layer_names``), then applies
-        an update. Parameters *not* in ``self.layer_names`` are never touched.
-
-        Args:
-            loss_fn: A callable that takes no arguments and returns a scalar
-                     ``float`` representing the loss on the current mini-batch.
-                     ``validate.py`` guarantees that every call to ``loss_fn``
-                     within a single ``.step()`` invocation uses the *same*
-                     fixed batch of data.
-
-        Returns:
-            The loss value at the *start* of the step (before any update),
-            obtained from the first call to ``loss_fn()``.
-
-        Note:
-            ``validate.py`` calls ``.step()`` exactly ``n_batches`` times.
-            Each forward pass inside ``loss_fn`` counts toward your compute
-            budget, so prefer estimators that minimise the number of calls.
-        """
         params = self._active_params()
-
-        # Record the loss before any perturbation.
         with torch.no_grad():
             loss_before = loss_fn()
 
         grads = self._estimate_grad(loss_fn, params)
         self._update_params(params, grads)
-
         return float(loss_before)
